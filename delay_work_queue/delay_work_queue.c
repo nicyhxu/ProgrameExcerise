@@ -555,7 +555,7 @@ static int dwq_mmap(struct file *filp, struct vm_area_struct *vma)
         return -EINVAL;
 
     pfn = page_to_pfn(dev->shm_page);
-    vma->vm_flags |= VM_SHARED;
+    vm_flags_set(vma, VM_SHARED);
     ret = remap_pfn_range(vma, vma->vm_start, pfn,
                           vma->vm_end - vma->vm_start,
                           vma->vm_page_prot);
