@@ -21,8 +21,7 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 
-/* kthread_worker + kthread_work are declared in <linux/kthread.h> */
-static DEFINE_KTHREAD_WORKER(buffer_toggle_worker);
+static struct kthread_worker buffer_toggle_worker;
 static struct kthread_work   buffer_toggle_work;
 static struct task_struct   *buffer_toggle_thread;
 
@@ -42,7 +41,8 @@ static int __init example_init(void)
 {
     int i;
 
-    /* initialise the work item */
+    /* initialise worker and work item */
+    kthread_init_worker(&buffer_toggle_worker);
     kthread_init_work(&buffer_toggle_work, osd_toggle_buffer);
 
     /* create and start the kthread */
