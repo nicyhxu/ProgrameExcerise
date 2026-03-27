@@ -99,9 +99,13 @@ struct dwq_fd_ctx {
     struct list_head   done_list;
     spinlock_t         done_lock;
 
-    /* server 侧：待处理请求队列 */
+    /* server 侧：待处理请求队列（未被 read 取走） */
     struct list_head   pending_list;
     spinlock_t         pending_lock;
+
+    /* server 侧：已被 read 取走、等待 write(REPLY) 的事务 */
+    struct list_head   dispatched_list;
+    spinlock_t         dispatched_lock;
 
     /* 角色 */
     int                is_server;
@@ -262,6 +266,8 @@ static int dwq_open(struct inode *inode, struct file *filp)
     spin_lock_init(&ctx->done_lock);
     INIT_LIST_HEAD(&ctx->pending_list);
     spin_lock_init(&ctx->pending_lock);
+    INIT_LIST_HEAD(&ctx->dispatched_list);
+    spin_lock_init(&ctx->dispatched_lock);
     INIT_LIST_HEAD(&ctx->subscribed);
     spin_lock_init(&ctx->subscribed_lock);
 
@@ -331,6 +337,24 @@ static int dwq_release(struct inode *inode, struct file *filp)
     }
     spin_unlock_irqrestore(&ctx->pending_lock, flags);
 
+    /* 5. 释放 dispatched_list（已 read 但未 reply 的事务），同样通知 caller */
+    spin_lock_irqsave(&ctx->dispatched_lock, flags);
+    list_for_each_entry_safe(tx, tmp_tx, &ctx->dispatched_list, node) {
+        list_del(&tx->node);
+        tx->reply.handle   = tx->msg.handle;
+        tx->reply.cmd      = tx->msg.cmd;
+        tx->reply.tx_id    = tx->msg.tx_id;
+        tx->reply.result   = DWQ_RESULT_ENODEV;
+        snprintf(tx->reply.data, DWQ_MAX_DATA, "server closed");
+        tx->reply.data_len = strlen(tx->reply.data);
+
+        spin_lock(&tx->caller->done_lock);
+        list_add_tail(&tx->node, &tx->caller->done_list);
+        spin_unlock(&tx->caller->done_lock);
+        wake_up_interruptible(&tx->caller->wait);
+    }
+    spin_unlock_irqrestore(&ctx->dispatched_lock, flags);
+
     kfree(ctx);
     printk(KERN_INFO "dwq: close pid=%d\n", current->pid);
     return 0;
@@ -362,10 +386,11 @@ static ssize_t dwq_write(struct file *filp, const char __user *buf,
             return -EPERM;
 
         tx = NULL;
-        spin_lock_irqsave(&ctx->pending_lock, flags);
+        /* 从 dispatched_list 查（tx 已被 read() 摘出，等待 reply） */
+        spin_lock_irqsave(&ctx->dispatched_lock, flags);
         {
             struct dwq_transaction *t;
-            list_for_each_entry(t, &ctx->pending_list, node) {
+            list_for_each_entry(t, &ctx->dispatched_list, node) {
                 if (t->msg.tx_id == msg.tx_id) {
                     tx = t;
                     list_del(&tx->node);
@@ -373,7 +398,7 @@ static ssize_t dwq_write(struct file *filp, const char __user *buf,
                 }
             }
         }
-        spin_unlock_irqrestore(&ctx->pending_lock, flags);
+        spin_unlock_irqrestore(&ctx->dispatched_lock, flags);
 
         if (!tx) {
             printk(KERN_ERR "dwq: REPLY unknown tx_id=%u\n", msg.tx_id);
@@ -415,6 +440,20 @@ static ssize_t dwq_write(struct file *filp, const char __user *buf,
 
         deliver_event(target_ctx, msg.handle, 0,
                       DWQ_RESULT_OK, msg.data, msg.data_len, msg.tx_id);
+
+        /* callback 模式：tx 不走 done_list，直接从 dispatched_list 摘出并 free */
+        if (ctx->is_server) {
+            struct dwq_transaction *t, *tmp_t;
+            spin_lock_irqsave(&ctx->dispatched_lock, flags);
+            list_for_each_entry_safe(t, tmp_t, &ctx->dispatched_list, node) {
+                if (t->msg.tx_id == msg.tx_id) {
+                    list_del(&t->node);
+                    kfree(t);
+                    break;
+                }
+            }
+            spin_unlock_irqrestore(&ctx->dispatched_lock, flags);
+        }
         printk(KERN_INFO "dwq: EVENT handle=%u → callback client\n",
                msg.handle);
         return (ssize_t)count;
@@ -489,14 +528,20 @@ static ssize_t dwq_read(struct file *filp, char __user *buf,
             return ret;
 
         spin_lock_irqsave(&ctx->pending_lock, flags);
-        if (!list_empty(&ctx->pending_list))
+        if (!list_empty(&ctx->pending_list)) {
             tx = list_first_entry(&ctx->pending_list,
                                   struct dwq_transaction, node);
-        /* tx 留在 pending_list，等 write(REPLY) 按 tx_id 匹配 */
+            list_del(&tx->node);   /* 从 pending 摘出 */
+        }
         spin_unlock_irqrestore(&ctx->pending_lock, flags);
 
         if (!tx)
             return -EAGAIN;
+
+        /* 放入 dispatched_list，等 write(REPLY) 按 tx_id 匹配后 free */
+        spin_lock_irqsave(&ctx->dispatched_lock, flags);
+        list_add_tail(&tx->node, &ctx->dispatched_list);
+        spin_unlock_irqrestore(&ctx->dispatched_lock, flags);
 
         if (copy_to_user(buf, &tx->msg, sizeof(tx->msg)))
             return -EFAULT;

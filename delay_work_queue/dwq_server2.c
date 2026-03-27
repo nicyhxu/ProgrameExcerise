@@ -108,11 +108,14 @@ int main(void)
             strncpy(cb_msg.data, reply_data, DWQ_MAX_DATA - 1);
 
             n = write(g_fd, &cb_msg, sizeof(cb_msg));
-            if (n < 0)
-                perror("write callback");
-            else
+            if (n < 0) {
+                /* callback handle 已注销（client 退出），忽略此次回调 */
+                fprintf(stderr, "[server2] CALLBACK handle=%u gone (client exited), skip\n",
+                        req.callback_handle);
+            } else {
                 printf("[server2] CALLBACK → handle=%u \"%s\"\n",
                        req.callback_handle, reply_data);
+            }
 
         } else {
             /* ---- 普通 Reply 模式 ---- */
