@@ -31,6 +31,7 @@
 #include <linux/ioctl.h>
 #include <linux/string.h>
 #include <linux/errno.h>
+#include <linux/device.h>
 
 #include "dwq_uapi.h"
 
@@ -56,6 +57,8 @@ struct dwq_dev {
     /* char device bookkeeping */
     struct cdev              cdev;
     dev_t                    devno;
+    struct class            *cls;
+    struct device           *dev;
 
     /* workqueue – one shared queue, one delayed_work slot            */
     struct workqueue_struct *wq;
@@ -351,9 +354,29 @@ static int __init dwq_init(void)
     g_dwq.handles[DWQ_HANDLE_DEFAULT].registered = 1;
     g_dwq.handles[DWQ_HANDLE_DEFAULT].name       = "default-worker";
 
-    printk(KERN_INFO "dwq: loaded  major=%d  minor=%d\n",
-           MAJOR(g_dwq.devno), MINOR(g_dwq.devno));
-    printk(KERN_INFO "dwq: create node:  mknod /dev/dwq c %d 0\n",
+    /* auto-create /dev/dwq via udev (no manual mknod needed) */
+    g_dwq.cls = class_create("dwq");
+    if (IS_ERR(g_dwq.cls)) {
+        ret = PTR_ERR(g_dwq.cls);
+        printk(KERN_ERR "dwq: class_create failed: %d\n", ret);
+        destroy_workqueue(g_dwq.wq);
+        cdev_del(&g_dwq.cdev);
+        unregister_chrdev_region(g_dwq.devno, 1);
+        return ret;
+    }
+
+    g_dwq.dev = device_create(g_dwq.cls, NULL, g_dwq.devno, NULL, "dwq");
+    if (IS_ERR(g_dwq.dev)) {
+        ret = PTR_ERR(g_dwq.dev);
+        printk(KERN_ERR "dwq: device_create failed: %d\n", ret);
+        class_destroy(g_dwq.cls);
+        destroy_workqueue(g_dwq.wq);
+        cdev_del(&g_dwq.cdev);
+        unregister_chrdev_region(g_dwq.devno, 1);
+        return ret;
+    }
+
+    printk(KERN_INFO "dwq: loaded  major=%d  /dev/dwq created\n",
            MAJOR(g_dwq.devno));
 
     return 0;
@@ -364,6 +387,8 @@ static void __exit dwq_exit(void)
     cancel_delayed_work_sync(&g_dwq.dwork);
     flush_workqueue(g_dwq.wq);
     destroy_workqueue(g_dwq.wq);
+    device_destroy(g_dwq.cls, g_dwq.devno);
+    class_destroy(g_dwq.cls);
     cdev_del(&g_dwq.cdev);
     unregister_chrdev_region(g_dwq.devno, 1);
     printk(KERN_INFO "dwq: unloaded\n");
