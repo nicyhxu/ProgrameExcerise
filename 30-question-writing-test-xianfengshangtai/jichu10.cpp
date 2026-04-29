@@ -7,10 +7,17 @@ using namespace std;
 #define N 100
 
 struct goods {
-	int sign;
+	bool s1[N];
+	int k;
+	int b;
 	int w; 
 	int p; 
-}a[N],b[N];
+};
+struct HEAP {
+	KNAPNODE*p;
+	int b;  //所指节点的上界;
+};
+
 
 bool m(goods a,goods b)
 {
